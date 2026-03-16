@@ -1,0 +1,360 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AgentCore Scanner - Centralized Spoke (Member Account)'
+
+Parameters:
+  SecurityAccountId:
+    Type: String
+    Description: 'AWS Account ID of the central security account'
+
+  ScannerExternalId:
+    Type: String
+    Description: 'External ID for cross-account role assumption (must match hub deployment)'
+    MinLength: 16
+    MaxLength: 128
+    NoEcho: true
+
+  CentralEventBusArn:
+    Type: String
+    Description: 'ARN of the central EventBridge bus in the security account'
+
+Resources:
+  SpokeAssumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'agentcore-scanner-spoke-role'
+      Description: 'Role assumed by central scanner to scan AgentCore runtimes in this account'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${SecurityAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ScannerExternalId
+      Policies:
+        - PolicyName: AgentCoreAndECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AgentCoreList
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:ListGatewayTargets
+                Resource: '*'
+
+              - Sid: AgentCoreRead
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:GetGatewayTarget
+                Resource: '*'
+
+              - Sid: ECRDescribeImages
+                Effect: Allow
+                Action:
+                  - ecr:DescribeImages
+                Resource: !Sub 'arn:aws:ecr:*:${AWS::AccountId}:repository/*'
+
+              - Sid: IAMPolicyAnalysis
+                Effect: Allow
+                Action:
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+
+              - Sid: BedrockModelMetadata
+                Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: '*'
+
+      Tags:
+        - Key: Name
+          Value: 'agentcore-scanner-spoke-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ========== EventBridge Forwarding Rules ==========
+  AgentCoreCreateEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'agentcore-scanner-create-runtime'
+      Description: 'Forward AgentCore CreateAgentRuntime events to central bus'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.bedrock-agentcore
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - bedrock-agentcore.amazonaws.com
+          eventName:
+            - CreateAgentRuntime
+      Targets:
+        - Arn: !Ref CentralEventBusArn
+          Id: CentralEventBus
+          RoleArn: !GetAtt EventBridgeForwardRole.Arn
+
+  AgentCoreUpdateEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'agentcore-scanner-update-runtime'
+      Description: 'Forward AgentCore UpdateAgentRuntime events to central bus'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.bedrock-agentcore
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - bedrock-agentcore.amazonaws.com
+          eventName:
+            - UpdateAgentRuntime
+      Targets:
+        - Arn: !Ref CentralEventBusArn
+          Id: CentralEventBus
+          RoleArn: !GetAtt EventBridgeForwardRole.Arn
+
+  AgentCoreGatewayTargetEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'agentcore-scanner-create-gateway-target'
+      Description: 'Forward AgentCore CreateGatewayTarget events to central bus'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.bedrock-agentcore
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - bedrock-agentcore.amazonaws.com
+          eventName:
+            - CreateGatewayTarget
+      Targets:
+        - Arn: !Ref CentralEventBusArn
+          Id: CentralEventBus
+          RoleArn: !GetAtt EventBridgeForwardRole.Arn
+
+  EventBridgeForwardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'agentcore-scanner-eventbridge-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutEventsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Ref CentralEventBusArn
+      Tags:
+        - Key: Name
+          Value: 'agentcore-scanner-eventbridge-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ========== KMS + CloudTrail ==========
+  SpokeKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for AgentCore Scanner spoke encryption'
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt*'
+              - 'kms:Decrypt*'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Describe*'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+          - Sid: AllowCloudTrail
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - 'kms:Encrypt*'
+              - 'kms:Decrypt*'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Describe*'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: 'agentcore-scanner-spoke-kms'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: '/aws/cloudtrail/agentcore-scanner'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt SpokeKMSKey.Arn
+
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'agentcore-scanner-trail-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SpokeKMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 7
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/agentcore-scanner-trail'
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'aws:SourceAccount': !Ref AWS::AccountId
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/agentcore-scanner-trail'
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt CloudTrailBucket.Arn
+              - !Sub '${CloudTrailBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  CloudTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: 'agentcore-scanner-trail'
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: false
+      IncludeGlobalServiceEvents: true
+      EnableLogFileValidation: true
+      KMSKeyId: !Ref SpokeKMSKey
+      CloudWatchLogsLogGroupArn: !Sub '${CloudTrailLogGroup.Arn}:*'
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogsRole.Arn
+      AdvancedEventSelectors:
+        - Name: 'AgentCoreManagementEvents'
+          FieldSelectors:
+            - Field: 'eventCategory'
+              Equals:
+                - 'Management'
+
+  CloudTrailLogsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'agentcore-scanner-cloudtrail-logs-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${CloudTrailLogGroup.Arn}:*'
+      Tags:
+        - Key: Name
+          Value: 'agentcore-scanner-cloudtrail-logs-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  SpokeRoleArn:
+    Description: 'ARN of the role for central scanner to assume'
+    Value: !GetAtt SpokeAssumeRole.Arn
+    Export:
+      Name: 'AgentCoreScannerSpokeRoleArn'
+
+  EventBridgeRoleArn:
+    Description: 'ARN of the EventBridge forwarding role'
+    Value: !GetAtt EventBridgeForwardRole.Arn
+    Export:
+      Name: 'AgentCoreScannerEventBridgeRoleArn'
+
+  CloudTrailName:
+    Description: 'Name of the CloudTrail trail'
+    Value: !Ref CloudTrail
+    Export:
+      Name: 'AgentCoreScannerCloudTrail'
+
+  KMSKeyArn:
+    Description: 'ARN of the KMS key used for encryption'
+    Value: !GetAtt SpokeKMSKey.Arn
+    Export:
+      Name: 'AgentCoreScannerSpokeKMSKey'

@@ -1,0 +1,77 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AgentCore Scanner - Minimal Spoke (IAM Role Only, No CloudTrail)'
+
+Parameters:
+  SecurityAccountId:
+    Type: String
+    Description: 'AWS Account ID of the central security account'
+
+  ScannerExternalId:
+    Type: String
+    Description: 'External ID for cross-account role assumption'
+    MinLength: 16
+    MaxLength: 128
+    NoEcho: true
+
+Resources:
+  SpokeAssumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'agentcore-scanner-spoke-role'
+      Description: 'Role assumed by central scanner to scan AgentCore runtimes in this account'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${SecurityAccountId}:root'
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref ScannerExternalId
+      Policies:
+        - PolicyName: AgentCoreAndECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AgentCoreAccess
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:GetGatewayTarget
+                  - bedrock-agentcore:ListGatewayTargets
+                Resource: '*'
+
+              - Sid: ECRDescribeImages
+                Effect: Allow
+                Action:
+                  - ecr:DescribeImages
+                Resource: !Sub 'arn:aws:ecr:*:${AWS::AccountId}:repository/*'
+
+              - Sid: IAMPolicyAnalysis
+                Effect: Allow
+                Action:
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+
+              - Sid: BedrockModelMetadata
+                Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                Resource: '*'
+
+      Tags:
+        - Key: Name
+          Value: 'agentcore-scanner-spoke-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  SpokeRoleArn:
+    Description: 'ARN of the role for central scanner to assume'
+    Value: !GetAtt SpokeAssumeRole.Arn
+    Export:
+      Name: 'AgentCoreScannerSpokeRoleArn'

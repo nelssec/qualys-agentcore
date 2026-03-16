@@ -1,0 +1,1155 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AgentCore Scanner - Centralized Hub (Security Account)'
+
+Parameters:
+  QualysSecretArn:
+    Type: String
+    Description: 'ARN of existing Secrets Manager secret containing Qualys credentials'
+
+  ArtifactsBucket:
+    Type: String
+    Description: 'S3 bucket containing Lambda code and layer artifacts'
+
+  LambdaCodeKey:
+    Type: String
+    Description: 'S3 key for Lambda function code zip'
+    Default: 'agentcore-scanner/lambda-code.zip'
+
+  ExistingRoleArn:
+    Type: String
+    Description: 'ARN of existing Qualys connector IAM role with ECR read access'
+    Default: ''
+
+  ExistingRoleName:
+    Type: String
+    Description: 'Name of existing Qualys connector IAM role'
+    Default: 'agentcore-qualys-ecr-reader'
+
+  MaxPollAttempts:
+    Type: Number
+    Description: 'Max times to poll for scan completion'
+    Default: 30
+    MinValue: 5
+    MaxValue: 60
+
+  PollIntervalSeconds:
+    Type: Number
+    Description: 'Seconds between poll attempts'
+    Default: 60
+    MinValue: 30
+    MaxValue: 300
+
+  OrganizationId:
+    Type: String
+    Description: 'AWS Organization ID (e.g., o-xxxxxxxxxx)'
+    Default: ''
+
+  SpokeAccountIds:
+    Type: CommaDelimitedList
+    Description: 'Comma-separated spoke account IDs (leave empty if using OrganizationId)'
+    Default: ''
+
+  EnableS3Results:
+    Type: String
+    Description: 'Create S3 bucket for storing scan results'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableSNSNotifications:
+    Type: String
+    Description: 'Create SNS topic for scan notifications'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableScanCache:
+    Type: String
+    Description: 'Enable DynamoDB scan cache'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableInventoryTable:
+    Type: String
+    Description: 'Enable DynamoDB inventory table for agent runtime tracking'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableMCPDetection:
+    Type: String
+    Description: 'Enable MCP server detection and classification'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  EnableAIServiceDetection:
+    Type: String
+    Description: 'Enable AI service detection from runtime configs'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  CacheTTLDays:
+    Type: Number
+    Description: 'Number of days to cache scan results'
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+
+  ScannerReservedConcurrency:
+    Type: Number
+    Description: 'Reserved concurrent executions for Scanner Lambda'
+    Default: 0
+    MinValue: 0
+    MaxValue: 100
+
+  ScannerMemorySize:
+    Type: Number
+    Description: 'Memory size for Scanner Lambda (MB)'
+    Default: 256
+    MinValue: 128
+    MaxValue: 1024
+
+  ScannerTimeout:
+    Type: Number
+    Description: 'Timeout for Scanner Lambda (seconds)'
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+
+  EnableBulkScan:
+    Type: String
+    Description: 'Enable bulk scan Lambda'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  BulkScanSchedule:
+    Type: String
+    Description: 'Cron schedule for periodic bulk scans (empty = manual only)'
+    Default: ''
+
+  BulkScanCodeKey:
+    Type: String
+    Description: 'S3 key for bulk scan Lambda code zip'
+    Default: 'agentcore-scanner/bulk-scan.zip'
+
+  BulkScanDefaultRegions:
+    Type: String
+    Description: 'Comma-separated list of regions for bulk scan'
+    Default: ''
+
+  EnableAccessLogging:
+    Type: String
+    Description: 'Enable S3 access logging'
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  ScannerExternalId:
+    Type: String
+    Description: 'External ID for cross-account role assumption'
+    MinLength: 16
+    MaxLength: 128
+    NoEcho: true
+
+
+Conditions:
+  CreateS3Bucket: !Equals [!Ref EnableS3Results, 'true']
+  CreateSNSTopic: !Equals [!Ref EnableSNSNotifications, 'true']
+  CreateScanCache: !Equals [!Ref EnableScanCache, 'true']
+  CreateInventoryTable: !Equals [!Ref EnableInventoryTable, 'true']
+  UseOrganization: !Not [!Equals [!Ref OrganizationId, '']]
+  CreateBulkScan: !Equals [!Ref EnableBulkScan, 'true']
+  CreateBulkScanSchedule: !And
+    - !Condition CreateBulkScan
+    - !Not [!Equals [!Ref BulkScanSchedule, '']]
+  UseReservedConcurrency: !Not [!Equals [!Ref ScannerReservedConcurrency, 0]]
+  CreateAccessLogging: !Equals [!Ref EnableAccessLogging, 'true']
+  CreateAccessLoggingForResults: !And
+    - !Condition CreateS3Bucket
+    - !Condition CreateAccessLogging
+
+Resources:
+  # ========== KMS ==========
+  ScannerKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for AgentCore Scanner encryption'
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt*'
+              - 'kms:Decrypt*'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Describe*'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+          - Sid: AllowSNS
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey*'
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-kms-key'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ScannerKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-scanner'
+      TargetKeyId: !Ref ScannerKMSKey
+
+  # ========== Access Logs ==========
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateAccessLogging
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-access-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldAccessLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-access-logs'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateAccessLogging
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              ArnLike:
+                'aws:SourceArn': !Sub 'arn:aws:s3:::${AWS::StackName}-*'
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: DenyUnencryptedTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # ========== EventBridge ==========
+  CentralEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${AWS::StackName}-central-bus'
+
+  CentralEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref CentralEventBus
+      StatementId: AllowSpokeAccountsToPutEvents
+      Statement:
+        Effect: Allow
+        Principal:
+          AWS: !If
+            - UseOrganization
+            - '*'
+            - !Ref SpokeAccountIds
+        Action:
+          - events:PutEvents
+        Resource: !GetAtt CentralEventBus.Arn
+        Condition: !If
+          - UseOrganization
+          - StringEquals:
+              aws:PrincipalOrgID: !Ref OrganizationId
+          - !Ref AWS::NoValue
+
+  # ========== S3 Scan Results ==========
+  ScanResultsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateS3Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-scan-results-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref ScannerKMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration: !If
+        - CreateAccessLoggingForResults
+        - DestinationBucketName: !Ref AccessLogsBucket
+          LogFilePrefix: 'scan-results/'
+        - !Ref AWS::NoValue
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldScans
+            Status: Enabled
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scan-results'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ========== SNS ==========
+  ScanNotificationsTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateSNSTopic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-scan-notifications'
+      DisplayName: 'AgentCore Scan Notifications'
+      KmsMasterKeyId: !Ref ScannerKMSKey
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scan-notifications'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ========== DynamoDB ==========
+  ScanCacheTable:
+    Type: AWS::DynamoDB::Table
+    Condition: CreateScanCache
+    Properties:
+      TableName: !Sub '${AWS::StackName}-scan-cache'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: image_digest
+          AttributeType: S
+      KeySchema:
+        - AttributeName: image_digest
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref ScannerKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scan-cache'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  InventoryTable:
+    Type: AWS::DynamoDB::Table
+    Condition: CreateInventoryTable
+    Properties:
+      TableName: !Sub '${AWS::StackName}-inventory'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: agent_runtime_arn
+          AttributeType: S
+        - AttributeName: account_id
+          AttributeType: S
+        - AttributeName: ecr_image_uri
+          AttributeType: S
+      KeySchema:
+        - AttributeName: agent_runtime_arn
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: account-id-index
+          KeySchema:
+            - AttributeName: account_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ecr-image-uri-index
+          KeySchema:
+            - AttributeName: ecr_image_uri
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref ScannerKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-inventory'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ========== SQS DLQ ==========
+  ScannerDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-scanner-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: !Ref ScannerKMSKey
+      KmsDataKeyReusePeriodSeconds: 300
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scanner-dlq'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ========== Scanner Lambda ==========
+  ScannerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scanner-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ScannerLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ECRDescribeImages
+                Effect: Allow
+                Action:
+                  - ecr:DescribeImages
+                Resource: !Sub 'arn:aws:ecr:*:${AWS::AccountId}:repository/*'
+
+              - Sid: AgentCoreRead
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:GetGatewayTarget
+                  - bedrock-agentcore:ListGatewayTargets
+                Resource: '*'
+
+              - Sid: BedrockModelMetadata
+                Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: '*'
+
+              - Sid: IAMPolicyAnalysis
+                Effect: Allow
+                Action:
+                  - iam:GetRolePolicy
+                  - iam:ListRolePolicies
+                  - iam:ListAttachedRolePolicies
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/*'
+
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref QualysSecretArn
+
+              - Sid: AssumeRoleInSpokeAccounts
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/agentcore-scanner-spoke-role'
+                Condition: !If
+                  - UseOrganization
+                  - StringEquals:
+                      'aws:ResourceOrgID': !Ref OrganizationId
+                  - !Ref AWS::NoValue
+
+              - Sid: SQSDeadLetterQueue
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt ScannerDeadLetterQueue.Arn
+
+              - Sid: CloudWatchMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'cloudwatch:namespace': 'AgentCoreScanner'
+
+              - Sid: KMSAccess
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt ScannerKMSKey.Arn
+
+              - Sid: XRayTracing
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: '*'
+
+              - !If
+                - CreateScanCache
+                - Sid: DynamoDBCacheAccess
+                  Effect: Allow
+                  Action:
+                    - dynamodb:GetItem
+                    - dynamodb:PutItem
+                    - dynamodb:UpdateItem
+                  Resource: !GetAtt ScanCacheTable.Arn
+                - !Ref AWS::NoValue
+
+              - !If
+                - CreateInventoryTable
+                - Sid: DynamoDBInventoryAccess
+                  Effect: Allow
+                  Action:
+                    - dynamodb:GetItem
+                    - dynamodb:PutItem
+                    - dynamodb:UpdateItem
+                    - dynamodb:Scan
+                    - dynamodb:Query
+                  Resource:
+                    - !GetAtt InventoryTable.Arn
+                    - !Sub '${InventoryTable.Arn}/index/*'
+                - !Ref AWS::NoValue
+
+              - !If
+                - CreateS3Bucket
+                - Sid: S3Write
+                  Effect: Allow
+                  Action:
+                    - s3:PutObject
+                  Resource: !Sub '${ScanResultsBucket.Arn}/*'
+                - !Ref AWS::NoValue
+
+              - !If
+                - CreateSNSTopic
+                - Sid: SNSPublish
+                  Effect: Allow
+                  Action:
+                    - sns:Publish
+                  Resource: !Ref ScanNotificationsTopic
+                - !Ref AWS::NoValue
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scanner-lambda-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ScannerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-scanner'
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt ScannerKMSKey.Arn
+
+  ScannerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-scanner'
+      Description: 'Scans AgentCore runtimes via Qualys CS API and detects MCP/AI services'
+      Runtime: python3.11
+      Handler: handlers.lambda_handler
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Ref LambdaCodeKey
+      Role: !GetAtt ScannerLambdaRole.Arn
+      MemorySize: !Ref ScannerMemorySize
+      Timeout: !Ref ScannerTimeout
+      ReservedConcurrentExecutions: !If [UseReservedConcurrency, !Ref ScannerReservedConcurrency, !Ref 'AWS::NoValue']
+      DeadLetterConfig:
+        TargetArn: !GetAtt ScannerDeadLetterQueue.Arn
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          QUALYS_SECRET_ARN: !Ref QualysSecretArn
+          RESULTS_S3_BUCKET: !If [CreateS3Bucket, !Ref ScanResultsBucket, '']
+          SNS_TOPIC_ARN: !If [CreateSNSTopic, !Ref ScanNotificationsTopic, '']
+          SCAN_CACHE_TABLE: !If [CreateScanCache, !Ref ScanCacheTable, '']
+          INVENTORY_TABLE: !If [CreateInventoryTable, !Ref InventoryTable, '']
+          CACHE_TTL_DAYS: !Ref CacheTTLDays
+          CROSS_ACCOUNT_ROLE_NAME: 'agentcore-scanner-spoke-role'
+          SCANNER_EXTERNAL_ID: !Ref ScannerExternalId
+          EXISTING_ROLE_ARN: !Ref ExistingRoleArn
+          EXISTING_ROLE_NAME: !Ref ExistingRoleName
+          STATE_MACHINE_ARN: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-scan-workflow'
+          ENABLE_MCP_DETECTION: !Ref EnableMCPDetection
+          ENABLE_AI_SERVICE_DETECTION: !Ref EnableAIServiceDetection
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scanner'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ========== EventBridge Rule ==========
+  CentralEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-central-rule'
+      Description: 'Trigger scanner for AgentCore events from all accounts'
+      EventBusName: !Ref CentralEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.bedrock-agentcore
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - bedrock-agentcore.amazonaws.com
+          eventName:
+            - CreateAgentRuntime
+            - UpdateAgentRuntime
+            - CreateGatewayTarget
+      Targets:
+        - Arn: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-scan-workflow'
+          Id: StepFunctionsTarget
+          RoleArn: !GetAtt EventBridgeToStepFunctionsRole.Arn
+
+  # ========== Step Functions ==========
+  ScanStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-scanner'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-sfn-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  EventBridgeToStepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-eb-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-scan-workflow'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-eb-sfn-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ScanStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-scan-workflow'
+      RoleArn: !GetAtt ScanStateMachineRole.Arn
+      TracingConfiguration:
+        Enabled: true
+      Definition:
+        Comment: AgentCore Scanner - Qualys CS API Scan Workflow
+        StartAt: ParseEvent
+        States:
+          ParseEvent:
+            Type: Task
+            Resource: !GetAtt ScannerLambdaFunction.Arn
+            Parameters:
+              action: parse_event
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: HasImages
+
+          HasImages:
+            Type: Choice
+            Choices:
+              - Variable: $.has_images
+                BooleanEquals: false
+                Next: NoImages
+            Default: CheckCache
+
+          NoImages:
+            Type: Succeed
+            Comment: No ECR images found or gateway target processed
+
+          CheckCache:
+            Type: Task
+            Resource: !GetAtt ScannerLambdaFunction.Arn
+            Parameters:
+              action: check_cache
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 5
+                MaxAttempts: 3
+                BackoffRate: 2
+            Next: IsCached
+
+          IsCached:
+            Type: Choice
+            Choices:
+              - Variable: $.is_cached
+                BooleanEquals: true
+                Next: SkipScan
+            Default: GetRegistry
+
+          SkipScan:
+            Type: Succeed
+            Comment: Image already scanned recently
+
+          GetRegistry:
+            Type: Task
+            Resource: !GetAtt ScannerLambdaFunction.Arn
+            Parameters:
+              action: get_registry
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: SubmitScan
+
+          SubmitScan:
+            Type: Task
+            Resource: !GetAtt ScannerLambdaFunction.Arn
+            Parameters:
+              action: submit_scan
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+                BackoffRate: 2
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: WaitForScan
+
+          WaitForScan:
+            Type: Wait
+            Seconds: !Ref PollIntervalSeconds
+            Next: CheckStatus
+
+          CheckStatus:
+            Type: Task
+            Resource: !GetAtt ScannerLambdaFunction.Arn
+            Parameters:
+              action: check_status
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 10
+                MaxAttempts: 2
+            Next: EvaluateStatus
+
+          EvaluateStatus:
+            Type: Choice
+            Choices:
+              - Variable: $.scan_complete
+                BooleanEquals: true
+                Next: GetResults
+              - Variable: $.poll_count
+                NumericGreaterThanEquals: !Ref MaxPollAttempts
+                Next: ScanTimeout
+            Default: WaitForScan
+
+          ScanTimeout:
+            Type: Pass
+            Result:
+              status: timeout
+            ResultPath: $.scan_result
+            Next: Notify
+
+          GetResults:
+            Type: Task
+            Resource: !GetAtt ScannerLambdaFunction.Arn
+            Parameters:
+              action: get_results
+              input.$: $
+            ResultPath: $
+            Retry:
+              - ErrorEquals: [States.TaskFailed]
+                IntervalSeconds: 10
+                MaxAttempts: 3
+            Catch:
+              - ErrorEquals: [States.ALL]
+                ResultPath: $.error
+                Next: NotifyFailure
+            Next: Notify
+
+          Notify:
+            Type: Task
+            Resource: !GetAtt ScannerLambdaFunction.Arn
+            Parameters:
+              action: notify
+              input.$: $
+            End: true
+
+          NotifyFailure:
+            Type: Task
+            Resource: !GetAtt ScannerLambdaFunction.Arn
+            Parameters:
+              action: notify_failure
+              input.$: $
+            End: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-scan-workflow'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ========== Bulk Scan Lambda ==========
+  BulkScanLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: CreateBulkScan
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-bulk-scan-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BulkScanPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ListAgentRuntimes
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore:ListAgentRuntimes
+                  - bedrock-agentcore:ListGatewayTargets
+                Resource: '*'
+              - Sid: StartScanExecution
+                Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-scan-workflow'
+              - Sid: AssumeRoleInSpokeAccounts
+                Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/agentcore-scanner-spoke-role'
+                Condition: !If
+                  - UseOrganization
+                  - StringEquals:
+                      'aws:ResourceOrgID': !Ref OrganizationId
+                  - !Ref AWS::NoValue
+              - !If
+                - CreateInventoryTable
+                - Sid: DynamoDBInventoryRead
+                  Effect: Allow
+                  Action:
+                    - dynamodb:Scan
+                    - dynamodb:GetItem
+                    - dynamodb:UpdateItem
+                  Resource: !GetAtt InventoryTable.Arn
+                - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bulk-scan-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  BulkScanLambdaFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateBulkScan
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-bulk-scan'
+      Description: 'Periodic sync of all AgentCore runtimes across spoke accounts'
+      Runtime: python3.11
+      Handler: bulk_scan.lambda_handler
+      Code:
+        S3Bucket: !Ref ArtifactsBucket
+        S3Key: !Ref BulkScanCodeKey
+      Role: !GetAtt BulkScanLambdaRole.Arn
+      MemorySize: 256
+      Timeout: 900
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${AWS::StackName}-scan-workflow'
+          CROSS_ACCOUNT_ROLE_NAME: 'agentcore-scanner-spoke-role'
+          SCANNER_EXTERNAL_ID: !Ref ScannerExternalId
+          INVENTORY_TABLE: !If [CreateInventoryTable, !Ref InventoryTable, '']
+          EXCLUDE_PATTERNS: !Sub '${AWS::StackName}-scanner,${AWS::StackName}-bulk-scan'
+          INVOCATION_DELAY_MS: '100'
+          DEFAULT_REGIONS: !Ref BulkScanDefaultRegions
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-bulk-scan'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  BulkScanLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: CreateBulkScan
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-bulk-scan'
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt ScannerKMSKey.Arn
+
+  BulkScanScheduleRule:
+    Type: AWS::Events::Rule
+    Condition: CreateBulkScanSchedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-bulk-scan-schedule'
+      Description: 'Scheduled bulk sync of AgentCore runtimes'
+      State: ENABLED
+      ScheduleExpression: !Ref BulkScanSchedule
+      Targets:
+        - Arn: !GetAtt BulkScanLambdaFunction.Arn
+          Id: BulkScanTarget
+          Input: '{}'
+
+  BulkScanSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateBulkScanSchedule
+    Properties:
+      FunctionName: !Ref BulkScanLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BulkScanScheduleRule.Arn
+
+  # ========== CloudWatch Alarms ==========
+  ScannerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopic
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scanner-errors'
+      AlarmDescription: 'Scanner Lambda has errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ScannerLambdaFunction
+      AlarmActions:
+        - !Ref ScanNotificationsTopic
+
+  ScannerThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopic
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scanner-throttles'
+      AlarmDescription: 'Scanner Lambda is being throttled'
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ScannerLambdaFunction
+      AlarmActions:
+        - !Ref ScanNotificationsTopic
+
+  ScannerDLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopic
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scanner-dlq-messages'
+      AlarmDescription: 'Messages in scanner DLQ - indicates failed scans'
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScannerDeadLetterQueue.QueueName
+      AlarmActions:
+        - !Ref ScanNotificationsTopic
+
+  ScanSuccessRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: CreateSNSTopic
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-scan-success-rate'
+      AlarmDescription: 'Low scan success rate'
+      MetricName: ScanSuccess
+      Namespace: AgentCoreScanner
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 0.9
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ScanNotificationsTopic
+
+Outputs:
+  CentralEventBusArn:
+    Description: 'ARN of the central EventBridge bus'
+    Value: !GetAtt CentralEventBus.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CentralEventBusArn'
+
+  CentralEventBusName:
+    Description: 'Name of the central EventBridge bus'
+    Value: !Ref CentralEventBus
+    Export:
+      Name: !Sub '${AWS::StackName}-CentralEventBusName'
+
+  ScannerLambdaArn:
+    Description: 'ARN of the Scanner Lambda function'
+    Value: !GetAtt ScannerLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ScannerLambdaArn'
+
+  ScanStateMachineArn:
+    Description: 'ARN of the scan workflow Step Functions state machine'
+    Value: !Ref ScanStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanStateMachineArn'
+
+  QualysSecretArnOutput:
+    Description: 'ARN of the Qualys credentials secret'
+    Value: !Ref QualysSecretArn
+
+  ScanResultsBucketName:
+    Description: 'Name of the S3 bucket for scan results'
+    Condition: CreateS3Bucket
+    Value: !Ref ScanResultsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanResultsBucket'
+
+  ScanNotificationsTopicArn:
+    Description: 'ARN of the SNS topic for scan notifications'
+    Condition: CreateSNSTopic
+    Value: !Ref ScanNotificationsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanNotificationsTopic'
+
+  SecurityAccountId:
+    Description: 'Security account ID (for spoke configuration)'
+    Value: !Ref AWS::AccountId
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityAccountId'
+
+  KMSKeyArn:
+    Description: 'ARN of the KMS key used for encryption'
+    Value: !GetAtt ScannerKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyArn'
+
+  ScanCacheTableName:
+    Description: 'Name of the DynamoDB scan cache table'
+    Condition: CreateScanCache
+    Value: !Ref ScanCacheTable
+    Export:
+      Name: !Sub '${AWS::StackName}-ScanCacheTable'
+
+  InventoryTableName:
+    Description: 'Name of the DynamoDB inventory table'
+    Condition: CreateInventoryTable
+    Value: !Ref InventoryTable
+    Export:
+      Name: !Sub '${AWS::StackName}-InventoryTable'
+
+  BulkScanLambdaArn:
+    Description: 'ARN of the Bulk Scan Lambda function'
+    Condition: CreateBulkScan
+    Value: !GetAtt BulkScanLambdaFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BulkScanLambdaArn'
+
+  AccessLogsBucketName:
+    Description: 'Name of the S3 bucket for access logs'
+    Condition: CreateAccessLogging
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessLogsBucket'

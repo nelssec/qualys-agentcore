@@ -1,0 +1,120 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AgentCore Scanner - Org CloudTrail EventBridge Forwarder (Management Account)'
+
+Parameters:
+  HubAccountId:
+    Type: String
+    Description: 'AWS Account ID of the hub/security account'
+    AllowedPattern: '^\d{12}$'
+
+  HubEventBusName:
+    Type: String
+    Description: 'Name of the central EventBridge bus in the hub account'
+    Default: 'agentcore-scanner-hub-central-bus'
+
+  HubRegion:
+    Type: String
+    Description: 'Region of the hub account EventBridge bus'
+    Default: 'us-east-1'
+
+Resources:
+  # Forward CreateAgentRuntime events
+  AgentCoreCreateForwardRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'agentcore-org-forward-create-runtime'
+      Description: 'Forward AgentCore CreateAgentRuntime from org CloudTrail to hub'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.bedrock-agentcore
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - bedrock-agentcore.amazonaws.com
+          eventName:
+            - CreateAgentRuntime
+      Targets:
+        - Arn: !Sub 'arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${HubEventBusName}'
+          Id: HubEventBus
+          RoleArn: !GetAtt ForwarderRole.Arn
+
+  # Forward UpdateAgentRuntime events
+  AgentCoreUpdateForwardRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'agentcore-org-forward-update-runtime'
+      Description: 'Forward AgentCore UpdateAgentRuntime from org CloudTrail to hub'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.bedrock-agentcore
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - bedrock-agentcore.amazonaws.com
+          eventName:
+            - UpdateAgentRuntime
+      Targets:
+        - Arn: !Sub 'arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${HubEventBusName}'
+          Id: HubEventBus
+          RoleArn: !GetAtt ForwarderRole.Arn
+
+  # Forward CreateGatewayTarget events
+  AgentCoreGatewayTargetForwardRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: 'agentcore-org-forward-create-gateway-target'
+      Description: 'Forward AgentCore CreateGatewayTarget from org CloudTrail to hub'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.bedrock-agentcore
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - bedrock-agentcore.amazonaws.com
+          eventName:
+            - CreateGatewayTarget
+      Targets:
+        - Arn: !Sub 'arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${HubEventBusName}'
+          Id: HubEventBus
+          RoleArn: !GetAtt ForwarderRole.Arn
+
+  ForwarderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'agentcore-scanner-org-forwarder-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutEventsToHub
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub 'arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${HubEventBusName}'
+      Tags:
+        - Key: Name
+          Value: 'agentcore-scanner-org-forwarder-role'
+        - Key: ManagedBy
+          Value: CloudFormation
+
+Outputs:
+  ForwarderRoleArn:
+    Description: 'ARN of the EventBridge forwarder role'
+    Value: !GetAtt ForwarderRole.Arn
+
+  HubEventBusTarget:
+    Description: 'Target hub EventBridge bus ARN'
+    Value: !Sub 'arn:aws:events:${HubRegion}:${HubAccountId}:event-bus/${HubEventBusName}'

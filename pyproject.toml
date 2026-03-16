@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentcore-scanner"
+version = "1.0.0"
+description = "Automated vulnerability scanning and inventory for AWS Bedrock AgentCore runtimes"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.28.0",
+    "botocore>=1.31.0",
+]
+
+[tool.setuptools]
+py-modules = []
+packages = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.0.0",
+    "moto[all]>=4.0.0",
+    "cfn-lint>=0.80.0",
+    "pyyaml>=6.0",
+    "jsonschema>=4.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["scanner-lambda", "scripts"]
+markers = [
+    "unit: Unit tests (mocked, no AWS required)",
+    "integration: Integration tests (requires AWS credentials)",
+    "smoke: Smoke tests (deploys real resources)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::pytest.PytestUnraisableExceptionWarning",
+]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["scanner-lambda"]
+omit = ["tests/*", "*/__pycache__/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError",
+]
